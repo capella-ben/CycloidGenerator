@@ -67,6 +67,37 @@ def addOrUpdateParam(params, name, value, unit, comment):
     return params.add(name, adsk.core.ValueInput.createByReal(value), unit, comment)
 
 
+def constrainDiameter(sketch, circle, expression):
+    """Add a diameter dimension to a sketch circle and drive it by a parameter expression.
+
+    Lets the circle's size track a user parameter after the model is built,
+    instead of staying pinned to whatever real value it was created with.
+    """
+    center = circle.centerSketchPoint.geometry
+    textPoint = adsk.core.Point3D.create(center.x + circle.radius, center.y + circle.radius, center.z)
+    dim = sketch.sketchDimensions.addDiameterDimension(circle, textPoint, True)
+    dim.parameter.expression = expression
+    return dim
+
+
+def constrainPosition(sketch, point, dxExpression, dyExpression, refX, refY):
+    """Drive a sketch point's X/Y offset from the sketch origin by parameter expressions.
+
+    refX/refY are the point's as-built coordinates (cm), used only to place the
+    dimension text near the geometry -- they don't affect the constraint itself.
+    """
+    origin = sketch.originPoint
+    textPointX = adsk.core.Point3D.create(refX, refY - 0.5, 0)
+    textPointY = adsk.core.Point3D.create(refX - 0.5, refY, 0)
+    dimX = sketch.sketchDimensions.addDistanceDimension(
+        origin, point, adsk.fusion.DimensionOrientations.HorizontalDimensionOrientation, textPointX, True)
+    dimX.parameter.expression = dxExpression
+    dimY = sketch.sketchDimensions.addDistanceDimension(
+        origin, point, adsk.fusion.DimensionOrientations.VerticalDimensionOrientation, textPointY, True)
+    dimY.parameter.expression = dyExpression
+    return dimX, dimY
+
+
 def calcEcc(rotorDia, reductionRatio):
     """Calculate the Eccentricity
 
@@ -302,32 +333,131 @@ class commandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             # Define the command dialog.
 
             reductionRatio = inputs.addIntegerSpinnerCommandInput('reductionRatio', 'Reduction Ration (x:1)', 3, 100, 1, 30)
+            reductionRatio.tooltip = 'Reduction Ratio'
+            reductionRatio.tooltipDescription = \
+                "How many times the input shaft must rotate for the output to rotate once (x:1). " \
+                "Sets the number of housing rollers (Reduction Ratio + 1) and, together with Roller " \
+                "Diameter, drives the Roller Pitch Circle Diameter and Eccentricity below."
+
+            rollerDia = inputs.addValueInput('rollerDia', 'Roller Diameter', 'mm', adsk.core.ValueInput.createByString('5 mm'))
+            rollerDia.tooltip = 'Roller Diameter'
+            rollerDia.tooltipDescription = \
+                "Diameter of the individual pins that make up the fixed outer housing ring the rotor " \
+                "rolls against. A primary input -- together with Reduction Ratio it determines the " \
+                "Roller Pitch Circle Diameter and Eccentricity below."
+
             rotorDia = inputs.addValueInput('rotorDia', 'Roller Pitch Circle Diameter (PCD)', 'mm', adsk.core.ValueInput.createByReal(10.0))
+            rotorDia.isEnabled = False
+            rotorDia.tooltip = 'Roller Pitch Circle Diameter (PCD)'
+            rotorDia.tooltipDescription = \
+                "Diameter of the circle that the housing rollers sit on -- roughly the overall size " \
+                "of the gearset. Calculated automatically from Roller Diameter and Reduction Ratio; " \
+                "read-only -- change Roller Diameter or Reduction Ratio to adjust it."
+
             depth = inputs.addValueInput('depth', 'Gear Height', 'mm', adsk.core.ValueInput.createByReal(1.0))
-            rollerDia = inputs.addValueInput('rollerDia', 'Roller Diameter', 'mm', adsk.core.ValueInput.createByReal(0.0))
+            depth.tooltip = 'Gear Height'
+            depth.tooltipDescription = \
+                "Extrusion depth (thickness) of the rotor, the housing rollers, and the output bearings."
+
             eccentricity = inputs.addTextBoxCommandInput('eccentricity', 'Eccentricity', '', 1, True)
+            eccentricity.tooltip = 'Eccentricity'
+            eccentricity.tooltipDescription = \
+                "Offset between the rotor's rotational centre and its geometric centre, driven by the " \
+                "input shaft to produce the wobbling motion the cycloidal drive relies on. Calculated " \
+                "automatically from Roller Diameter and Reduction Ratio -- read-only."
+
             minWallThickness = inputs.addValueInput('minWallThickness', 'Minimum Wall Thickness', 'mm', adsk.core.ValueInput.createByString('1.5 mm'))
+            minWallThickness.tooltip = 'Minimum Wall Thickness'
+            minWallThickness.tooltipDescription = \
+                "Minimum material thickness to leave around the input eccentric bore and the output " \
+                "bearing bores. Used to compute the recommended bearing sizes shown below, not to " \
+                "constrain the bearing dimensions you actually enter."
+
             shaftDia = inputs.addValueInput('shaftDia', 'Input Shaft Diameter', 'mm', adsk.core.ValueInput.createByString('5 mm'))
+            shaftDia.tooltip = 'Input Shaft Diameter'
+            shaftDia.tooltipDescription = "Diameter of the input shaft that drives the eccentric bearing."
+
             bearingGuidance = inputs.addTextBoxCommandInput('bearingGuidance', 'Min. Recommended Bearing Bore', '', 1, True)
+            bearingGuidance.tooltip = 'Min. Recommended Bearing Bore'
+            bearingGuidance.tooltipDescription = \
+                "Smallest input bearing bore (ID) that clears the Input Shaft Diameter plus the " \
+                "current eccentricity while keeping the Minimum Wall Thickness. For reference only -- " \
+                "set the actual bore with Bearing Bore (ID) below."
+
             bearingID = inputs.addValueInput('bearingID', 'Bearing Bore (ID)', 'mm', adsk.core.ValueInput.createByString('8 mm'))
+            bearingID.tooltip = 'Bearing Bore (ID)'
+            bearingID.tooltipDescription = \
+                "Inner diameter of the input bearing that carries the eccentric. Must be large enough " \
+                "to clear the input shaft plus eccentricity -- see Min. Recommended Bearing Bore above."
+
             bearingOD = inputs.addValueInput('bearingOD', 'Bearing Outer Diameter (OD)', 'mm', adsk.core.ValueInput.createByString('22 mm'))
+            bearingOD.tooltip = 'Bearing Outer Diameter (OD)'
+            bearingOD.tooltipDescription = \
+                "Outer diameter of the input bearing. Also sets the diameter of the bore cut through " \
+                "the rotor's own centre to house it."
+
             bearingWidth = inputs.addValueInput('bearingWidth', 'Bearing Width', 'mm', adsk.core.ValueInput.createByString('7 mm'))
+            bearingWidth.tooltip = 'Bearing Width'
+            bearingWidth.tooltipDescription = \
+                "Width (through-thickness) of the input eccentric bushing and input bearing placeholder solids."
+
             numOutputHoles = inputs.addIntegerSpinnerCommandInput('numOutputHoles', 'Number of Output Holes', 3, 20, 1, 3)
+            numOutputHoles.tooltip = 'Number of Output Holes'
+            numOutputHoles.tooltipDescription = \
+                "How many output pin/bearing holes are cut through the rotor, evenly spaced around " \
+                "the Output Pin Circle Diameter. These transmit the reduced rotor motion to the output shaft."
+
             outputShaftDia = inputs.addValueInput('outputShaftDia', 'Output Shaft Diameter', 'mm', adsk.core.ValueInput.createByString('5 mm'))
+            outputShaftDia.tooltip = 'Output Shaft Diameter'
+            outputShaftDia.tooltipDescription = "Diameter of each output pin/shaft that rides in the rotor's output holes."
+
             outputBearingGuidance = inputs.addTextBoxCommandInput('outputBearingGuidance', 'Min. Recommended Output Bearing OD', '', 1, True)
+            outputBearingGuidance.tooltip = 'Min. Recommended Output Bearing OD'
+            outputBearingGuidance.tooltipDescription = \
+                "Smallest output bearing OD that clears the Output Shaft Diameter while keeping the " \
+                "Minimum Wall Thickness. For reference only -- set the actual OD with Output Bearing " \
+                "Diameter (OD) below."
+
             outputBearingDia = inputs.addValueInput('outputBearingDia', 'Output Bearing Diameter (OD)', 'mm', adsk.core.ValueInput.createByString('10 mm'))
+            outputBearingDia.tooltip = 'Output Bearing Diameter (OD)'
+            outputBearingDia.tooltipDescription = \
+                "Outer diameter of each output bearing. Combined with the eccentricity, this sets how " \
+                "oversized the rotor's output holes are cut so the rotor can wobble freely around the pins."
+
             minEdgeWallThickness = inputs.addValueInput('minEdgeWallThickness', 'Minimum Wall Thickness (Holes to Outer Edge)', 'mm', adsk.core.ValueInput.createByString('1.5 mm'))
+            minEdgeWallThickness.tooltip = 'Minimum Wall Thickness (Holes to Outer Edge)'
+            minEdgeWallThickness.tooltipDescription = \
+                "Minimum material thickness to leave between any hole cut in the rotor (input or " \
+                "output) and the rotor's outer lobe edge."
+
             outputPinCircleGuidance = inputs.addTextBoxCommandInput('outputPinCircleGuidance', 'Output Pin Circle Diameter Range', '', 2, True)
+            outputPinCircleGuidance.tooltip = 'Output Pin Circle Diameter Range'
+            outputPinCircleGuidance.tooltipDescription = \
+                "Valid range for Output Pin Circle Diameter given the current dimensions -- outside " \
+                "this range the output holes would overlap each other, overlap the input bearing hole, " \
+                "or get too close to the rotor's outer edge. For reference only."
+
             outputPinCircleDia = inputs.addValueInput('outputPinCircleDia', 'Output Pin Circle Diameter', 'mm', adsk.core.ValueInput.createByString('50 mm'))
+            outputPinCircleDia.tooltip = 'Output Pin Circle Diameter'
+            outputPinCircleDia.tooltipDescription = \
+                "Diameter of the circle that the output holes/bearings are evenly spaced around -- see " \
+                "Output Pin Circle Diameter Range above for the valid range."
+
             validationStatus = inputs.addTextBoxCommandInput('validationStatus', 'Validation Status', '', 2, True)
+            validationStatus.tooltip = 'Validation Status'
+            validationStatus.tooltipDescription = \
+                "Explains why the current dimensions can't be built, if applicable. Must be blank " \
+                "before OK can be clicked."
+
+            # rotorDia is read-only -- derive it from Roller Diameter and Reduction Ratio
+            # (the two independent inputs that drive it) before anything reads its value.
+            housingDia = (rollerDia.value / 2) * (4 * (reductionRatio.value + 1))
+            rotorDia.value = housingDia / math.pi
 
             # re-calculate the eccentricity and update the UI.
-            Ecc, rollerRadius = calcEcc(rotorDia.value, reductionRatio.value)
-            eccentricity.text = str(round(Ecc, 3)*10) + 'mm'
+            Ecc, _ = calcEcc(rotorDia.value, reductionRatio.value)
+            eccentricity.text = str(round(Ecc * 10, 3)) + 'mm'
             print(f'eccentricity: {eccentricity.text}')
-
-            # calculate the roller radius
-            rollerDia.value = rollerRadius * 2
 
             # re-calculate the minimum recommended bearing bore and update the UI.
             minBore = calcMinBearingBore(shaftDia.value, rotorDia.value, reductionRatio.value, minWallThickness.value * 10)
@@ -403,20 +533,20 @@ class commandInputChangedHandler(adsk.core.InputChangedEventHandler):
                 else:
                     outputPinCircleGuidance.text = 'No valid diameter with current dimensions -- adjust other values'
 
-            if changedInput.id == 'rotorDia' or changedInput.id == 'reductionRatio':
+            if changedInput.id == 'rollerDia' or changedInput.id == 'reductionRatio':
+                # rotorDia is read-only and derived from these two independent inputs --
+                # recompute it first so everything below (eccentricity, guidance) is
+                # based on the current rollerDia/reductionRatio combination.
+                housingDia = (rollerDia.value / 2) * (4 * (reductionRatio.value + 1))
+                rotorDia.value = housingDia / math.pi
+
                 # re-calculate the eccentricity and update the UI.
-                Ecc, rollerRadius = calcEcc(rotorDia.value, reductionRatio.value)
-                eccentricity.text = str(round(Ecc, 3)*10) + 'mm'
-                rollerDia.value = rollerRadius * 2
+                Ecc, _ = calcEcc(rotorDia.value, reductionRatio.value)
+                eccentricity.text = str(round(Ecc * 10, 3)) + 'mm'
                 print(f'Eccentricity has changed to: {eccentricity.text}')
 
                 updateBearingGuidance()
                 updateOutputPinCircleGuidance()
-
-            if changedInput.id == 'rollerDia':
-                # re-calculate the rotor Dia
-                housingDia = (rollerDia.value / 2) * (4 * (reductionRatio.value + 1))
-                rotorDia.value = (housingDia / math.pi)
 
             if changedInput.id == 'shaftDia':
                 updateBearingGuidance()
@@ -503,8 +633,6 @@ class commandExecuteHandler(adsk.core.CommandEventHandler):
 
 
             # - The values below are all in CM as this is the default internal unit of Fusion 360
-            rotorThickness = depth.value
-            housingThickness = 1 * rotorThickness
             rotorRadius = (rotorDia.value)/2                          # rotor radius (cm)
             numberOfRollers = reductionRatio.value + 1                # number of rollers
             
@@ -520,7 +648,6 @@ class commandExecuteHandler(adsk.core.CommandEventHandler):
             shaftRadius = shaftDia.value / 2
             bearingIDRadius = bearingID.value / 2
             bearingODRadius = bearingOD.value / 2
-            bearingWidthCm = bearingWidth.value
 
             # --- Output holes / output bearings (all values cm) ---
             outputShaftRadius = outputShaftDia.value / 2            # also used as the output bearing's bore radius (nominal fit)
@@ -622,7 +749,7 @@ class commandExecuteHandler(adsk.core.CommandEventHandler):
             line2 = lines.addByTwoPoints(line1.startSketchPoint, crv.endSketchPoint)
 
             prof = sk.profiles.item(0)
-            distance = adsk.core.ValueInput.createByReal(rotorThickness)
+            distance = adsk.core.ValueInput.createByString('gearHeight')
 
             # Get extrude features
             extrudes = rotor.features.extrudeFeatures
@@ -668,10 +795,11 @@ class commandExecuteHandler(adsk.core.CommandEventHandler):
             # Cut a hole through the rotor at its own rotational centre (rotor-local
             # origin) for the input bearing's outer race.
             rotorHoleSketch = rotor.sketches.add(root.xYConstructionPlane)
-            rotorHoleSketch.sketchCurves.sketchCircles.addByCenterRadius(adsk.core.Point3D.create(0, 0, 0), bearingODRadius)
+            rotorHoleCircle = rotorHoleSketch.sketchCurves.sketchCircles.addByCenterRadius(adsk.core.Point3D.create(0, 0, 0), bearingODRadius)
+            constrainDiameter(rotorHoleSketch, rotorHoleCircle, 'bearingOD')
 
             rotorHoleProfile = rotorHoleSketch.profiles.item(0)
-            rotorHoleDistance = adsk.core.ValueInput.createByReal(rotorThickness)
+            rotorHoleDistance = adsk.core.ValueInput.createByString('gearHeight')
             rotor.features.extrudeFeatures.addSimple(rotorHoleProfile, rotorHoleDistance, adsk.fusion.FeatureOperations.CutFeatureOperation)
 
             # Cut the output holes through the rotor. These sit on a simple circle of
@@ -692,17 +820,36 @@ class commandExecuteHandler(adsk.core.CommandEventHandler):
             # possible relative to the (non-circular) lobe boundary -- see
             # minEdgeWallThickness below.
             outputHolePhaseOffset = math.pi / numOutputHoles.value
+            outputHoleAngleDeg = math.degrees(outputHolePhaseOffset)
             outputHoleSketch = rotor.sketches.add(root.xYConstructionPlane)
-            outputHoleCircles = outputHoleSketch.sketchCurves.sketchCircles
-            for i in range(numOutputHoles.value):
-                outputHoleTheta = (2 * math.pi * i / numOutputHoles.value) + outputHolePhaseOffset
-                outputHoleX = outputPinCircleRadius * math.cos(outputHoleTheta)
-                outputHoleY = outputPinCircleRadius * math.sin(outputHoleTheta)
-                outputHoleCircles.addByCenterRadius(adsk.core.Point3D.create(outputHoleX, outputHoleY, 0), outputHoleRadius)
+            outputHoleX = outputPinCircleRadius * math.cos(outputHolePhaseOffset)
+            outputHoleY = outputPinCircleRadius * math.sin(outputHolePhaseOffset)
+            outputHoleCircle = outputHoleSketch.sketchCurves.sketchCircles.addByCenterRadius(
+                adsk.core.Point3D.create(outputHoleX, outputHoleY, 0), outputHoleRadius)
+            constrainDiameter(outputHoleSketch, outputHoleCircle, 'outputBearingDia + (2 * Eccentricity)')
+            constrainPosition(
+                outputHoleSketch, outputHoleCircle.centerSketchPoint,
+                'outputPinCircleDia / 2 * cos({0:.6f} deg)'.format(outputHoleAngleDeg),
+                'outputPinCircleDia / 2 * sin({0:.6f} deg)'.format(outputHoleAngleDeg),
+                outputHoleX, outputHoleY)
 
-            outputHoleDistance = adsk.core.ValueInput.createByReal(rotorThickness)
-            for outputHoleProfile in outputHoleSketch.profiles:
-                rotor.features.extrudeFeatures.addSimple(outputHoleProfile, outputHoleDistance, adsk.fusion.FeatureOperations.CutFeatureOperation)
+            outputHoleProfile = outputHoleSketch.profiles.item(0)
+            outputHoleDistance = adsk.core.ValueInput.createByString('gearHeight')
+            outputHoleCutFeature = rotor.features.extrudeFeatures.addSimple(
+                outputHoleProfile, outputHoleDistance, adsk.fusion.FeatureOperations.CutFeatureOperation)
+
+            # Pattern the single output-hole cut around the rotor's own centre so the
+            # hole count stays tied to numOutputHoles via a real Fusion pattern feature
+            # (rather than a fixed Python loop), matching how the lobes/rollers/output
+            # bearings are already patterned elsewhere in this script.
+            outputHoleInputEntities = adsk.core.ObjectCollection.create()
+            outputHoleInputEntities.add(outputHoleCutFeature)
+            outputHoleCircularFeats = rotor.features.circularPatternFeatures
+            outputHolePatternInput = outputHoleCircularFeats.createInput(outputHoleInputEntities, zAxis)
+            outputHolePatternInput.quantity = adsk.core.ValueInput.createByString('numOutputHoles')
+            outputHolePatternInput.totalAngle = adsk.core.ValueInput.createByString('360 deg')
+            outputHolePatternInput.isSymmetric = False
+            outputHoleCircularFeats.add(outputHolePatternInput)
 
             #Offset the rotor to make the shaft rotat concentric with origin
             transform = rotorOcc.transform
@@ -728,7 +875,7 @@ class commandExecuteHandler(adsk.core.CommandEventHandler):
             sketchCircles.addByCenterRadius(centerPoint, rollerRadius)
 
             rollerProfile = rollerSketch.profiles.item(0)
-            distance = adsk.core.ValueInput.createByReal(housingThickness)
+            distance = adsk.core.ValueInput.createByString('gearHeight')
             rollerExtrudes = housing.features.extrudeFeatures.addSimple(rollerProfile, distance, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
             # Get the extrusion body
             roller = rollerExtrudes.bodies.item(0)
@@ -761,8 +908,10 @@ class commandExecuteHandler(adsk.core.CommandEventHandler):
 
             eccentricSketch = eccentric.sketches.add(root.xYConstructionPlane)
             eccentricCircles = eccentricSketch.sketchCurves.sketchCircles
-            eccentricCircles.addByCenterRadius(adsk.core.Point3D.create(0, 0, 0), shaftRadius)
-            eccentricCircles.addByCenterRadius(adsk.core.Point3D.create(ecc, 0, 0), bearingIDRadius)
+            eccentricShaftCircle = eccentricCircles.addByCenterRadius(adsk.core.Point3D.create(0, 0, 0), shaftRadius)
+            eccentricBoreCircle = eccentricCircles.addByCenterRadius(adsk.core.Point3D.create(ecc, 0, 0), bearingIDRadius)
+            constrainDiameter(eccentricSketch, eccentricShaftCircle, 'shaftDia')
+            constrainDiameter(eccentricSketch, eccentricBoreCircle, 'bearingID')
 
             # Bore (main axis) and OD (offset by ecc) aren't concentric, but the bore
             # nests fully inside the OD (validated above), so this sketch has exactly
@@ -774,7 +923,7 @@ class commandExecuteHandler(adsk.core.CommandEventHandler):
                     eccentricProfile = prof
                     break
 
-            eccentricDistance = adsk.core.ValueInput.createByReal(bearingWidthCm)
+            eccentricDistance = adsk.core.ValueInput.createByString('bearingWidth')
             eccentricExtrudes = eccentric.features.extrudeFeatures.addSimple(eccentricProfile, eccentricDistance, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
             eccentricExtrudes.bodies.item(0).name = 'input_eccentric'
 
@@ -785,8 +934,10 @@ class commandExecuteHandler(adsk.core.CommandEventHandler):
 
             bearingSketch = bearing.sketches.add(root.xYConstructionPlane)
             bearingCenter = adsk.core.Point3D.create(ecc, 0, 0)
-            bearingSketch.sketchCurves.sketchCircles.addByCenterRadius(bearingCenter, bearingIDRadius)
-            bearingSketch.sketchCurves.sketchCircles.addByCenterRadius(bearingCenter, bearingODRadius)
+            bearingIDCircle = bearingSketch.sketchCurves.sketchCircles.addByCenterRadius(bearingCenter, bearingIDRadius)
+            bearingODCircle = bearingSketch.sketchCurves.sketchCircles.addByCenterRadius(bearingCenter, bearingODRadius)
+            constrainDiameter(bearingSketch, bearingIDCircle, 'bearingID')
+            constrainDiameter(bearingSketch, bearingODCircle, 'bearingOD')
 
             # Concentric this time, but the same "ring = 2 loops" selection still applies.
             bearingProfile = None
@@ -795,7 +946,7 @@ class commandExecuteHandler(adsk.core.CommandEventHandler):
                     bearingProfile = prof
                     break
 
-            bearingDistance = adsk.core.ValueInput.createByReal(bearingWidthCm)
+            bearingDistance = adsk.core.ValueInput.createByString('bearingWidth')
             bearingExtrudes = bearing.features.extrudeFeatures.addSimple(bearingProfile, bearingDistance, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
             bearingExtrudes.bodies.item(0).name = 'input_bearing'
 
@@ -812,8 +963,19 @@ class commandExecuteHandler(adsk.core.CommandEventHandler):
             outputBearingCenter = adsk.core.Point3D.create(
                 outputPinCircleRadius * math.cos(outputHolePhaseOffset),
                 outputPinCircleRadius * math.sin(outputHolePhaseOffset), 0)
-            outputBearingSketch.sketchCurves.sketchCircles.addByCenterRadius(outputBearingCenter, outputShaftRadius)
-            outputBearingSketch.sketchCurves.sketchCircles.addByCenterRadius(outputBearingCenter, outputBearingRadius)
+            outputBearingShaftCircle = outputBearingSketch.sketchCurves.sketchCircles.addByCenterRadius(outputBearingCenter, outputShaftRadius)
+            outputBearingODCircle = outputBearingSketch.sketchCurves.sketchCircles.addByCenterRadius(outputBearingCenter, outputBearingRadius)
+            constrainDiameter(outputBearingSketch, outputBearingShaftCircle, 'outputShaftDia')
+            constrainDiameter(outputBearingSketch, outputBearingODCircle, 'outputBearingDia')
+            # Fusion auto-adds a coincident constraint between the two circles' centre
+            # points since they're created at the same location -- constraining just
+            # one of them (rather than both) positions both circles without
+            # over-constraining the sketch.
+            constrainPosition(
+                outputBearingSketch, outputBearingShaftCircle.centerSketchPoint,
+                'outputPinCircleDia / 2 * cos({0:.6f} deg)'.format(outputHoleAngleDeg),
+                'outputPinCircleDia / 2 * sin({0:.6f} deg)'.format(outputHoleAngleDeg),
+                outputBearingCenter.x, outputBearingCenter.y)
 
             outputBearingProfile = None
             for prof in outputBearingSketch.profiles:
@@ -823,7 +985,7 @@ class commandExecuteHandler(adsk.core.CommandEventHandler):
 
             # Height matches the rotor thickness, since these bearings need to span the
             # full depth of the rotor's output holes (no separate width was specified).
-            outputBearingDistance = adsk.core.ValueInput.createByReal(rotorThickness)
+            outputBearingDistance = adsk.core.ValueInput.createByString('gearHeight')
             outputBearingExtrudes = outputBearingComp.features.extrudeFeatures.addSimple(outputBearingProfile, outputBearingDistance, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
             outputBearingBody = outputBearingExtrudes.bodies.item(0)
             outputBearingBody.name = 'output_bearing'
@@ -836,7 +998,7 @@ class commandExecuteHandler(adsk.core.CommandEventHandler):
             outputBearingCircularFeats = outputBearingComp.features.circularPatternFeatures
             outputBearingZAxis = outputBearingComp.zConstructionAxis
             outputBearingCircularInput = outputBearingCircularFeats.createInput(outputBearingEntities, outputBearingZAxis)
-            outputBearingCircularInput.quantity = adsk.core.ValueInput.createByReal(numOutputHoles.value)
+            outputBearingCircularInput.quantity = adsk.core.ValueInput.createByString('numOutputHoles')
             outputBearingCircularInput.totalAngle = adsk.core.ValueInput.createByString('360 deg')
             outputBearingCircularInput.isSymmetric = True
             outputBearingCircularFeats.add(outputBearingCircularInput)
